@@ -781,6 +781,201 @@ ${code}
     }
 )
 
+// ─── RSS 파싱 헬퍼 ──────────────────────────────────────────────────────────
+
+function extractTagValue(xml: string, tag: string): string {
+    const cdataRegex = new RegExp(`<${tag}[^>]*><!\\[CDATA\\[([\\s\\S]*?)\\]\\]><\\/${tag}>`, 'i')
+    const normalRegex = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, 'i')
+    const cdataMatch = cdataRegex.exec(xml)
+    if (cdataMatch) return cdataMatch[1].trim()
+    const normalMatch = normalRegex.exec(xml)
+    if (normalMatch) return normalMatch[1].trim()
+    return ''
+}
+
+function extractSourceName(xml: string): string {
+    const match = /<source[^>]*>([^<]*)<\/source>/i.exec(xml)
+    return match ? match[1].trim() : ''
+}
+
+function decodeHtmlEntities(text: string): string {
+    return text
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .replace(/&nbsp;/g, ' ')
+        .replace(/&#(\d+);/g, (_, code) => String.fromCharCode(Number(code)))
+}
+
+function stripHtmlTags(text: string): string {
+    return text.replace(/<[^>]+>/g, '').trim()
+}
+
+interface RSSItem {
+    title: string
+    link: string
+    pubDate: string
+    description: string
+    source: string
+}
+
+function parseRSSItems(xml: string): RSSItem[] {
+    const items: RSSItem[] = []
+    const itemRegex = /<item>([\s\S]*?)<\/item>/g
+    let match
+    while ((match = itemRegex.exec(xml)) !== null) {
+        const block = match[1]
+        const title = decodeHtmlEntities(stripHtmlTags(extractTagValue(block, 'title')))
+        const link = extractTagValue(block, 'link') || extractTagValue(block, 'guid')
+        const pubDate = extractTagValue(block, 'pubDate')
+        const description = decodeHtmlEntities(stripHtmlTags(extractTagValue(block, 'description')))
+        const source = decodeHtmlEntities(extractSourceName(block))
+        if (title && link) {
+            items.push({ title, link, pubDate, description, source })
+        }
+    }
+    return items
+}
+
+// ─── 기사 검색 도구 ──────────────────────────────────────────────────────────
+
+server.registerTool(
+    'search_articles',
+    {
+        description:
+            '텍스트(주제/키워드)를 입력하면 최근 1주일 동안의 관련 뉴스 기사 및 블로그를 검색하여 최신순/정확도순으로 반환합니다. 각 결과에는 클릭 가능한 실제 링크가 포함됩니다.',
+        inputSchema: z.object({
+            query: z.string().describe('검색할 텍스트 또는 주제 (예: "AI 반도체", "기후변화", "ChatGPT")'),
+            language: z
+                .enum(['ko', 'en'])
+                .optional()
+                .default('ko')
+                .describe('검색 언어 (ko: 한국어 뉴스, en: 영어 뉴스, 기본값: ko)'),
+            count: z
+                .number()
+                .min(1)
+                .max(20)
+                .optional()
+                .default(10)
+                .describe('반환할 결과 수 (기본값: 10, 최대: 20)'),
+            sort: z
+                .enum(['recent', 'relevance'])
+                .optional()
+                .default('recent')
+                .describe('정렬 기준 (recent: 최신순, relevance: 관련도순, 기본값: recent)')
+        }),
+        outputSchema: z.object({
+            content: z
+                .array(
+                    z.object({
+                        type: z.literal('text'),
+                        text: z.string()
+                    })
+                )
+                .describe('검색 결과 (마크다운 형식, 클릭 가능한 링크 포함)')
+        })
+    },
+    async ({ query, language, count, sort }) => {
+        const langParams =
+            language === 'ko'
+                ? 'hl=ko&gl=KR&ceid=KR:ko'
+                : 'hl=en-US&gl=US&ceid=US:en'
+        const encodedQuery = encodeURIComponent(query)
+        const url = `https://news.google.com/rss/search?q=${encodedQuery}&${langParams}`
+
+        let xmlText: string
+        try {
+            const response = await fetch(url, {
+                headers: { 'User-Agent': 'Mozilla/5.0 (compatible; RSS-Reader/1.0)' }
+            })
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`)
+            }
+            xmlText = await response.text()
+        } catch (err) {
+            const errorText = `기사 검색 중 오류가 발생했습니다: ${err instanceof Error ? err.message : String(err)}`
+            return {
+                content: [{ type: 'text' as const, text: errorText }],
+                structuredContent: { content: [{ type: 'text' as const, text: errorText }] }
+            }
+        }
+
+        const allItems = parseRSSItems(xmlText)
+
+        // 1주일 이내 기사만 필터링
+        const oneWeekAgo = new Date()
+        oneWeekAgo.setDate(oneWeekAgo.getDate() - 7)
+
+        const filtered = allItems.filter(item => {
+            if (!item.pubDate) return true
+            const d = new Date(item.pubDate)
+            return !isNaN(d.getTime()) && d >= oneWeekAgo
+        })
+
+        // 정렬: recent = 최신순, relevance = RSS 기본 순서(관련도) 유지 후 최신순 보조 정렬
+        const sorted =
+            sort === 'recent'
+                ? filtered.sort((a, b) => {
+                      const da = a.pubDate ? new Date(a.pubDate).getTime() : 0
+                      const db = b.pubDate ? new Date(b.pubDate).getTime() : 0
+                      return db - da
+                  })
+                : filtered // Google News RSS 기본 순서 = 관련도 기반
+
+        const results = sorted.slice(0, count)
+
+        if (results.length === 0) {
+            const noResult = `"${query}"에 대한 최근 1주일 내 기사를 찾지 못했습니다.\n검색어를 바꾸거나 언어 설정(language)을 변경해보세요.`
+            return {
+                content: [{ type: 'text' as const, text: noResult }],
+                structuredContent: { content: [{ type: 'text' as const, text: noResult }] }
+            }
+        }
+
+        const sortLabel = sort === 'recent' ? '최신순' : '관련도순'
+        const langLabel = language === 'ko' ? '한국어' : '영어'
+        const header = `# 🔍 "${query}" 관련 기사 (최근 1주일, ${langLabel}, ${sortLabel})\n총 **${results.length}**개 결과\n\n`
+
+        const body = results
+            .map((item, i) => {
+                let dateStr = ''
+                if (item.pubDate) {
+                    const d = new Date(item.pubDate)
+                    if (!isNaN(d.getTime())) {
+                        dateStr = d.toLocaleString('ko-KR', {
+                            year: 'numeric',
+                            month: '2-digit',
+                            day: '2-digit',
+                            hour: '2-digit',
+                            minute: '2-digit',
+                            hour12: false
+                        })
+                    }
+                }
+
+                const meta = [dateStr && `📅 ${dateStr}`, item.source && `📰 ${item.source}`]
+                    .filter(Boolean)
+                    .join('  |  ')
+
+                const desc =
+                    item.description && item.description.length > 0
+                        ? `\n> ${item.description.slice(0, 200)}${item.description.length > 200 ? '…' : ''}`
+                        : ''
+
+                return `### ${i + 1}. [${item.title}](${item.link})\n${meta}${desc}`
+            })
+            .join('\n\n---\n\n')
+
+        const text = header + body
+        return {
+            content: [{ type: 'text' as const, text }],
+            structuredContent: { content: [{ type: 'text' as const, text: text }] }
+        }
+    }
+)
+
 server
     .connect(new StdioServerTransport())
     .catch(console.error)
